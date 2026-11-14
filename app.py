@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Timesheet v1: runs fully offline on one machine.
+"""Timesheet v2: runs on one server; the models (Whisper, Qwen via Ollama) run on that server too.
 
-Speech-to-text: faster-whisper (local). Summaries: Ollama (local). Storage: SQLite. No internet at runtime.
+Speech-to-text: faster-whisper. Summaries: Ollama. Storage: SQLite. HTTPS comes from Caddy in front (deploy/setup.sh).
 
-  .venv/bin/python app.py                                  # serve on :8000
+  .venv/bin/python app.py                                      # serve on 127.0.0.1:8000
   .venv/bin/python app.py adduser admin "Your Name" --admin    # create a login (asks for the password)
+  .venv/bin/python app.py selftest                             # check that both models load and run
+  .venv/bin/python app.py backup DIR                           # copy the database into DIR (keeps 30)
 """
-import argparse, getpass, hashlib, hmac, json, os, queue, re, secrets, socket, sqlite3, ssl, sys, threading, time, traceback
+import argparse, getpass, hashlib, hmac, json, os, queue, re, secrets, sqlite3, sys, threading, time, traceback
 import urllib.error, urllib.request
 from datetime import datetime, timedelta, timezone
 from http.cookies import CookieError, SimpleCookie
@@ -14,26 +16,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-os.environ.setdefault("HF_HUB_OFFLINE", "1")  # Whisper loads from the local cache only, never the network
+os.environ.setdefault("HF_HUB_OFFLINE", "1")  # Whisper loads from the local cache only (setup downloads it)
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DB_PATH = Path(os.environ.get("TS_DB", ROOT / "data" / "timesheet.db"))
 AUDIO_DIR = DB_PATH.parent / "audio"
-CA_CERT = ROOT / "data" / "cert" / "ca.crt"
+HOST = os.environ.get("TS_HOST", "127.0.0.1")  # only Caddy, on the same machine, talks to the app
 PORT = int(os.environ.get("TS_PORT", "8000"))
-CERT, KEY = os.environ.get("TS_CERT"), os.environ.get("TS_KEY")
+PUBLIC_URL = os.environ.get("TS_PUBLIC_URL", "")  # set when behind the HTTPS proxy, e.g. https://timesheet.example.com
 WHISPER_MODEL = os.environ.get("TS_WHISPER", "large-v3")  # not large-v3-turbo: turbo can't translate
-# ponytail: Apple GPU ("mps", ~3x faster than CPU on an M4 Pro) is still marked experimental in CTranslate2;
-# set TS_WHISPER_DEVICE=cpu if transcriptions start failing. On a Linux box with an NVIDIA GPU: cuda + float16.
-_APPLE = sys.platform == "darwin" and os.uname().machine == "arm64"
-WHISPER_DEVICE = os.environ.get("TS_WHISPER_DEVICE", "mps" if _APPLE else "auto")
-WHISPER_COMPUTE = os.environ.get("TS_WHISPER_COMPUTE", "float16" if WHISPER_DEVICE in ("mps", "cuda") else "int8")
 LLM_MODEL = os.environ.get("TS_LLM", "qwen2.5:14b")  # 7B called tools "clients" and missed blockers in monthly summaries
 OLLAMA_URL = os.environ.get("TS_OLLAMA", "http://127.0.0.1:11434")
 IST = timezone(timedelta(hours=5, minutes=30))  # ponytail: IST has no DST, so a fixed offset is exact
 MAX_AUDIO = 50 * 1024 * 1024
 SESSION_SECS = 30 * 86400
+# Sent with every response. The app uses no inline scripts or styles, so 'self' covers everything.
+# (HSTS is added by Caddy, since it only makes sense over HTTPS.)
+SECURITY_HEADERS = [
+    ("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Permissions-Policy", "microphone=(self), camera=(), geolocation=()"),
+]
 
 DEFAULT_GLOSSARY = (
     "Midjourney, Runway, Kling, Veo, Sora, Pika, Luma, Higgsfield, Flux, Stable Diffusion, ComfyUI, LoRA, "
@@ -156,12 +161,17 @@ def check_pw(pw, stored):
 
 
 DUMMY_PW = hash_pw("x")  # checked for unknown login IDs, so response time doesn't reveal which IDs exist
-_failures = {}  # ponytail: in-memory login throttle, resets on restart
+_failures = {}  # ponytail: in-memory login throttle (per login ID and per IP), resets on restart
 
 
-def throttled(username):
-    _failures[username] = [t for t in _failures.get(username, []) if t > now() - 900]
-    return len(_failures[username]) >= 5
+def throttled(key, limit):
+    """True once `key` has `limit` failed logins in the last 15 minutes."""
+    if len(_failures) > 10_000:  # a bot trying random IDs: drop stale keys so this can't grow forever
+        for k in [k for k, ts in _failures.items() if ts[-1] < now() - 900]: del _failures[k]
+    recent = [t for t in _failures.get(key, []) if t > now() - 900]
+    if recent: _failures[key] = recent
+    else: _failures.pop(key, None)
+    return len(recent) >= limit
 
 
 def token_hash(tok): return hashlib.sha256(tok.encode()).hexdigest()
@@ -175,7 +185,7 @@ def clean_name(s):
 
 def clean_pw(s):
     s = str(s or "")
-    if len(s) < 6: raise HTTPError(400, "Password must be at least 6 characters")
+    if len(s) < 10: raise HTTPError(400, "Password must be at least 10 characters")  # the login page is on the internet
     return s
 
 
@@ -233,15 +243,33 @@ class Jobs:
 _whisper = None
 
 
-def run_whisper(path):
-    """Speech in Hindi, English or Hinglish -> English text."""
+def whisper_settings():
+    """Where Whisper runs: NVIDIA GPU if there is one, Apple GPU on a Mac, else the CPU. TS_WHISPER_DEVICE overrides."""
+    device = os.environ.get("TS_WHISPER_DEVICE")
+    if not device:
+        if sys.platform == "darwin" and os.uname().machine == "arm64":
+            device = "mps"  # ponytail: ~3x faster than CPU on an M4 Pro but "experimental" in CTranslate2
+        else:
+            import ctranslate2
+            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+    return device, os.environ.get("TS_WHISPER_COMPUTE") or ("float16" if device in ("cuda", "mps") else "int8")
+
+
+def load_whisper():
     global _whisper
     if _whisper is None:
         from faster_whisper import WhisperModel
-        _whisper = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE,
-                                cpu_threads=min(8, os.cpu_count() or 4), local_files_only=True)
+        device, compute = whisper_settings()
+        _whisper = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute,
+                                cpu_threads=os.cpu_count() or 4, local_files_only=True)
+    return _whisper
+
+
+def run_whisper(path):
+    """Speech in Hindi, English or Hinglish -> English text."""
     # ponytail: Whisper only reads the last ~220 tokens of the prompt, so a very long glossary loses its start
-    segments, _ = _whisper.transcribe(str(path), task="translate", initial_prompt="Glossary: " + glossary(), vad_filter=True)
+    segments, _ = load_whisper().transcribe(str(path), task="translate", initial_prompt="Glossary: " + glossary(),
+                                            vad_filter=True)
     return " ".join(s.text.strip() for s in segments).strip()
 
 
@@ -384,11 +412,12 @@ def route(method, path, auth="user"):
 
 
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
-        ".json": "application/manifest+json", ".png": "image/png", ".crt": "application/x-x509-ca-cert"}
+        ".json": "application/manifest+json", ".png": "image/png"}
 
 
 def cookie(value, max_age):
-    return ("Set-Cookie", f"sid={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}" + ("; Secure" if CERT else ""))
+    secure = "; Secure" if PUBLIC_URL.startswith("https://") else ""  # browsers then never send it over plain HTTP
+    return ("Set-Cookie", f"sid={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -401,6 +430,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_request(self, code="-", size="-"):
         if not isinstance(code, int) or code >= 400: super().log_request(code, size)
+
+    def end_headers(self):
+        for k, v in SECURITY_HEADERS: self.send_header(k, v)
+        super().end_headers()
+
+    def client_ip(self):
+        # Behind Caddy every request comes from 127.0.0.1; Caddy puts the real address last in X-Forwarded-For.
+        if PUBLIC_URL and self.client_address[0] == "127.0.0.1" and self.headers.get("X-Forwarded-For"):
+            return self.headers["X-Forwarded-For"].split(",")[-1].strip()
+        return self.client_address[0]
 
     def handle_any(self, method):
         url, self.extra, self.token = urlparse(self.path), [], None
@@ -437,8 +476,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def static(self, path):
         if path == "/favicon.ico": path = "/icon-192.png"  # browsers ask for this on every page load
-        f = CA_CERT if path == "/ca.crt" else (STATIC / (path.lstrip("/") or "index.html")).resolve()
-        if not f.is_file() or (f != CA_CERT and STATIC not in f.parents):
+        f = (STATIC / (path.lstrip("/") or "index.html")).resolve()
+        if not f.is_file() or STATIC not in f.parents:
             return self.reply(404, {"error": "Not found"})
         data = f.read_bytes()
         self.send_response(200)
@@ -496,10 +535,12 @@ def entry_json(e, owner):
 def login(h):
     b = h.body_json()
     username, pw = str(b.get("username", "")).strip().lower(), str(b.get("password", ""))
-    if throttled(username): raise HTTPError(429, "Too many attempts. Try again in 15 minutes.")
+    # 5 tries per login ID; 50 per address, high enough for a whole office sharing one internet connection.
+    keys = [("id:" + username, 5), ("ip:" + h.client_ip(), 50)]
+    if any(throttled(k, limit) for k, limit in keys): raise HTTPError(429, "Too many attempts. Try again in 15 minutes.")
     u = q1("SELECT * FROM users WHERE username=? AND active=1", username)
     if not check_pw(pw, u["pw"] if u else DUMMY_PW) or not u:
-        _failures.setdefault(username, []).append(now())
+        for k, _ in keys: _failures.setdefault(k, []).append(now())
         raise HTTPError(401, "Wrong login ID or password")
     tok = secrets.token_urlsafe(32)
     ex("DELETE FROM sessions WHERE expires<?", now())
@@ -516,6 +557,17 @@ def logout(h):
 
 @route("GET", "/api/me")
 def me(h): return {"me": user_json(h.user), "today": ist_day()}
+
+
+@route("GET", "/api/health", auth=None)
+def health(h):
+    """For an uptime monitor. Says nothing about users or data."""
+    try:
+        with urllib.request.urlopen(OLLAMA_URL + "/api/tags", timeout=2): ollama = True
+    except OSError:
+        ollama = False
+    return {"ok": True, "ollama": ollama,
+            "waiting": {"transcriptions": whisper_jobs.q.qsize(), "summaries": llm_jobs.q.qsize()}}
 
 
 @route("POST", "/api/entries")
@@ -684,17 +736,46 @@ def preflight():
             if not any(m["name"] in (LLM_MODEL, LLM_MODEL + ":latest") for m in json.load(r)["models"]):
                 print(f"! Ollama is running but {LLM_MODEL} is missing: ollama pull {LLM_MODEL}")
     except OSError:
-        print(f"! Ollama isn't reachable at {OLLAMA_URL}. Open the Ollama app (or run: ollama serve). "
-              "Summaries wait until it's up.")
+        print(f"! Ollama isn't reachable at {OLLAMA_URL}. Start it (server: sudo systemctl start ollama; "
+              "Mac: open the Ollama app). Summaries wait until it's up.")
 
 
-def lan_ip():
+def selftest():
+    """Load both models and run each once, so a broken setup fails here and not on the first real recording."""
+    ok = True
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("10.255.255.255", 1))  # UDP connect sends nothing; it just picks the outgoing interface
-            return s.getsockname()[0]
-    except OSError:
-        return None
+        import numpy as np
+        device, compute = whisper_settings()
+        print(f"Whisper {WHISPER_MODEL} on {device} ({compute}) ...", end=" ")
+        t = time.time()
+        segments, _ = load_whisper().transcribe(np.zeros(16000, dtype=np.float32), vad_filter=False)
+        list(segments)  # segments are lazy: this is what actually runs the model on the GPU/CPU
+        print(f"ok, {time.time() - t:.0f}s including loading")
+        if device == "cpu": print("  No GPU found: everything runs on the processor and is several times slower.")
+    except Exception as e:
+        ok = False
+        print(f"FAILED: {e}")
+    try:
+        print(f"Summaries with {LLM_MODEL} via Ollama ...", end=" ")
+        t = time.time()
+        llm("Reply with the single word OK.", "Say OK.")
+        print(f"ok, {time.time() - t:.0f}s")
+    except Exception as e:
+        ok = False
+        print(f"FAILED: {e}")
+    return ok
+
+
+def backup(dest):
+    """Copy the database into dest (safe while the app is running) and keep the newest 30 copies."""
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / f"timesheet-{datetime.now(IST):%Y-%m-%d}.db"
+    target = sqlite3.connect(out)
+    db().backup(target)  # SQLite's online backup: a consistent copy even mid-write
+    target.close()
+    for old in sorted(dest.glob("timesheet-*.db"))[:-30]: old.unlink()
+    print(f"Backed up to {out}")
 
 
 def adduser(argv):
@@ -712,20 +793,17 @@ def adduser(argv):
 def main():
     sys.stdout.reconfigure(line_buffering=True)  # show startup messages immediately, even when not in a terminal
     init_db()
-    if sys.argv[1:2] == ["adduser"]: return adduser(sys.argv[2:])
+    cmd, args = sys.argv[1:2], sys.argv[2:]
+    if cmd == ["adduser"]: return adduser(args)
+    if cmd == ["selftest"]: sys.exit(0 if selftest() else 1)
+    if cmd == ["backup"]: return backup(args[0] if args else DB_PATH.parent / "backups")
     preflight()
     requeue()
     whisper_jobs.start(); llm_jobs.start()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    scheme = "http"
-    if CERT:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(CERT, KEY)
-        server.socket, scheme = ctx.wrap_socket(server.socket, server_side=True), "https"
-    ip = lan_ip()
-    print(f"Timesheet is running: {scheme}://localhost:{PORT}" + (f"   (phones on this network: {scheme}://{ip}:{PORT})" if ip else ""))
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"Timesheet is running on http://{HOST}:{PORT}" + (f", public address {PUBLIC_URL}" if PUBLIC_URL else ""))
     if not q1("SELECT 1 FROM users WHERE is_admin=1"):
-        print('No admin yet. Create one:  .venv/bin/python app.py adduser admin "Your Name" --admin')
+        print('No admin yet. Create one with:  adduser admin "Your Name" --admin   (see README)')
     try: server.serve_forever()
     except KeyboardInterrupt: pass
 

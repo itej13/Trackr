@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Runs an app command on the server as the service user, with the server's settings:
+#   sudo /opt/timesheet/deploy/ts adduser admin "Your Name" --admin
+#   sudo /opt/timesheet/deploy/ts selftest
+#   sudo /opt/timesheet/deploy/ts backup /var/lib/timesheet/backups
+set -euo pipefail
+APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+[ "$(id -u)" = 0 ] || { echo "Run it with sudo."; exit 1; }
+cd /  # the service user may not be allowed into the folder you ran this from
+# shellcheck disable=SC2046  # settings are KEY=value lines with no spaces, so word-splitting is intended
+exec runuser -u timesheet -- env $(grep -E '^[A-Z_]+=' /etc/timesheet.env) "$APP_DIR/.venv/bin/python" "$APP_DIR/app.py" "$@"

@@ -9,9 +9,9 @@ import app  # noqa: E402  (must come after TS_DB is set)
 app.run_whisper = lambda path: "Rendered three Kling variants for the shoe client."
 app.llm = lambda system, user: f"summary of {user.count(chr(10))} lines"
 app.init_db()
-app.create_user("boss", "Boss", "secret1", is_admin=True)
-emp = app.create_user("emp", "Emp", "secret2", role="Video editor")
-app.create_user("other", "Other", "secret3")
+app.create_user("boss", "Boss", "secret-one-1", is_admin=True)
+emp = app.create_user("emp", "Emp", "secret-two-2", role="Video editor")
+app.create_user("other", "Other", "secret-three-3")
 srv = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_port}"
@@ -49,7 +49,7 @@ def record(call, cid, at_ms=None):
 # logins
 try: client("emp", "wrong")
 except AssertionError as e: assert "got 401" in str(e)
-boss, e1, other = client("boss", "secret1"), client("emp", "secret2"), client("other", "secret3")
+boss, e1, other = client("boss", "secret-one-1"), client("emp", "secret-two-2"), client("other", "secret-three-3")
 
 # record -> draft. The employee sees it with a preview summary; the admin sees nothing yet.
 eid = record(e1, "rec-0001")
@@ -107,5 +107,15 @@ assert "summary" not in e1("GET", f"/api/month?m={m}"), "monthly summaries are a
 boss("PATCH", f"/api/users/{emp}", {"active": False})
 e1("GET", "/api/me", expect=401)
 boss("PATCH", "/api/users/1", {"active": False}, expect=400)  # can't lock yourself out
+
+# internet-facing basics: health check, security headers, password length, login throttle
+with urllib.request.urlopen(BASE + "/api/health") as r: assert json.load(r)["ok"]
+with urllib.request.urlopen(BASE + "/") as r: assert "default-src 'self'" in r.headers["Content-Security-Policy"]
+boss("POST", "/api/users", {"username": "shorty", "name": "Shorty", "password": "short-pw"}, expect=400)
+for _ in range(5):
+    try: client("other", "wrong-password")
+    except AssertionError: pass
+try: client("other", "secret-three-3"); raise SystemExit("6th login after 5 failures should be refused")
+except AssertionError as e: assert "got 429" in str(e)
 
 print("all checks passed")
