@@ -11,7 +11,7 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR=/var/lib/timesheet
 ENV_FILE=/etc/timesheet.env
-LLM_MODEL=qwen2.5:14b
+LLM_MODEL=gemma4:12b
 PY="$APP_DIR/.venv/bin/python"
 
 say() { printf '\n== %s\n' "$*"; }
@@ -83,7 +83,7 @@ ${CUDA_LIBS:+LD_LIBRARY_PATH=$CUDA_LIBS}
 EOF
 chgrp timesheet "$ENV_FILE" && chmod 640 "$ENV_FILE"
 
-say "Models: $LLM_MODEL (~9 GB) and Whisper large-v3 (~3 GB). The first run downloads them."
+say "Models: $LLM_MODEL (~8 GB) and Whisper large-v3 (~3 GB). The first run downloads them."
 command -v ollama >/dev/null || curl -fsSL https://ollama.com/install.sh | sh  # Ollama listens on 127.0.0.1 only
 systemctl enable --now ollama >/dev/null
 for _ in $(seq 30); do ollama list >/dev/null 2>&1 && break; sleep 1; done

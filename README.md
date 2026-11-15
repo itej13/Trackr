@@ -2,7 +2,7 @@
 
 Employees record a voice note about their day, in Hindi, English or both, in the app or as a Slack message. The server turns it into English text and a short summary; they check it and submit. Admins see each person's days, summaries by day, month or any date range, tasks, and comments.
 
-Everything runs on one server you control. Speech-to-text (Whisper large-v3) and summaries (Qwen 2.5 14B via Ollama) both run on that server, so no transcript goes to an outside AI service. Data is one SQLite file. Two optional extras change what leaves the server: the **Google Sheet** keeps a copy of people, tasks, transcripts and day summaries in your Google account, and voice notes sent through **Slack** stay in Slack too.
+Everything runs on one server you control. Speech-to-text (Whisper large-v3) and summaries (Gemma 4 12B via Ollama) both run on that server, so no transcript goes to an outside AI service. Data is one SQLite file. Two optional extras change what leaves the server: the **Google Sheet** keeps a copy of people, tasks, transcripts and day summaries in your Google account, and voice notes sent through **Slack** stay in Slack too.
 
 This repo (Trackr) is the working tool; the tags `v1.0`, `v2.0` and `v3.0` mark each version. Version 1, fully offline on one Mac, also lives on as the separate baseline repo `itej13/voice-timesheet`, a template for new projects.
 
@@ -12,14 +12,14 @@ This repo (Trackr) is the working tool; the tags `v1.0`, `v2.0` and `v3.0` mark 
           ▼
  Server:  Caddy ──► app.py ──► SQLite        (nightly copy, kept 30 days)
                       ├─► Whisper large-v3   (NVIDIA GPU if there is one, else CPU)
-                      ├─► Ollama ─► Qwen 2.5 14B
+                      ├─► Ollama ─► Gemma 4 12B
                       ├─► Slack          (optional; the server connects out, no open port)
                       └─► Google Sheet   (optional; synced about once a minute)
 ```
 
 # Setting it up
 
-This part is for the person putting the app on a server. Do the steps in order; each one says how to check it worked. Expect about an hour, plus waiting while about 12 GB of AI models download.
+This part is for the person putting the app on a server. Do the steps in order; each one says how to check it worked. Expect about an hour, plus waiting while about 11 GB of AI models download.
 
 **Who does what**
 
@@ -33,7 +33,7 @@ This part is for the person putting the app on a server. Do the steps in order; 
 
 - An **Ubuntu 22.04 or 24.04** server you can reach over SSH as a user with `sudo`.
 - Ideally an **NVIDIA GPU with 20 GB or more** of memory (for example an RTX 4090, L4 or A10): notes become text in seconds. Without one it still works, in minutes per note; then give it at least 24 GB of RAM (32 GB is comfortable).
-- At least **40 GB of free disk** (the models alone are about 12 GB).
+- At least **40 GB of free disk** (the models alone are about 11 GB).
 - Optional: a domain or subdomain you can point at the server, such as `timesheet.yourcompany.com`. Without one the app gets a free address based on the server's IP.
 
 ## 1. Prepare the server
@@ -198,7 +198,7 @@ sudo systemctl start timesheet
 | `/opt/timesheet` | The code (this repo) |
 | `/var/lib/timesheet/timesheet.db` | All the data |
 | `/var/lib/timesheet/backups/` | Database copies |
-| `/var/lib/timesheet/models/` | The Whisper model (Ollama keeps Qwen in its own folder) |
+| `/var/lib/timesheet/models/` | The Whisper model (Ollama keeps Gemma in its own folder) |
 | `/var/lib/timesheet/slack.env`, `google-key.json` | Slack tokens and the Google key: `root:timesheet`, mode 640 |
 | `/etc/timesheet.env` | Settings written by `setup.sh`; it rewrites this file on every run, so don't edit it by hand |
 | Services | `timesheet` (the app), `timesheet-backup.timer`, `caddy` (HTTPS), `ollama` |
@@ -211,7 +211,7 @@ sudo systemctl start timesheet
 |---|---|
 | The address doesn't open, or a certificate warning | Ports 80 and 443 open in the provider's firewall; the domain's A record points at this server; `journalctl -u caddy -n 50` |
 | "The microphone only works over HTTPS" or no microphone | Use the `https://` address; allow the microphone for the site in the browser's settings |
-| Notes stay on "Transcribing…" or the self-test failed | `sudo /opt/timesheet/deploy/ts selftest`, then `journalctl -u timesheet -n 100`; `systemctl status ollama` and `ollama list` should show `qwen2.5:14b` |
+| Notes stay on "Transcribing…" or the self-test failed | `sudo /opt/timesheet/deploy/ts selftest`, then `journalctl -u timesheet -n 100`; `systemctl status ollama` and `ollama list` should show `gemma4:12b` |
 | Very slow (minutes per note) on a GPU server | `nvidia-smi` should list the card. If not, install the driver (`setup.sh` does it), reboot, run `setup.sh` again |
 | "Too many attempts" at login | Wait 15 minutes, or restart the app (`sudo systemctl restart timesheet`) |
 | Forgot the admin password | Another admin sets a new one under **Team → Edit**, or create a new admin with `ts adduser … --admin` |
@@ -246,7 +246,7 @@ sudo systemctl start timesheet
 | `TS_WHISPER` | `large-v3` | Don't use `large-v3-turbo`: it can't translate Hindi to English |
 | `TS_WHISPER_DEVICE` | NVIDIA GPU if found, Apple GPU on a Mac, else `cpu` | |
 | `TS_WHISPER_COMPUTE` | `float16` on a GPU, `int8` on CPU | |
-| `TS_LLM` | `qwen2.5:14b` | Any Ollama model. `qwen2.5:7b` is twice as fast, but in tests its monthly summaries listed tools as clients and missed open blockers |
+| `TS_LLM` | `gemma4:12b` | Any Ollama model. Tested against `qwen2.5:14b`, `qwen3:8b` and `qwen3.5:9b` on the demo data: Gemma was the only one that invented nothing and got every task check right, and it's about twice as fast as Qwen 2.5 14B |
 | `TS_OLLAMA` | `http://127.0.0.1:11434` | |
 
 # Development
@@ -255,7 +255,7 @@ Run it on your own computer:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-ollama pull qwen2.5:14b
+ollama pull gemma4:12b
 .venv/bin/python -c "from faster_whisper import download_model; download_model('large-v3')"
 .venv/bin/python app.py adduser admin "Your Name" --admin
 .venv/bin/python app.py                      # http://localhost:8000

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Timesheet v2: runs on one server; the models (Whisper, Qwen via Ollama) run on that server too.
+"""Timesheet v2: runs on one server; the models (Whisper, Gemma via Ollama) run on that server too.
 
 Speech-to-text: faster-whisper. Summaries: Ollama. Storage: SQLite. HTTPS comes from Caddy in front (deploy/setup.sh).
 
@@ -27,7 +27,9 @@ HOST = os.environ.get("TS_HOST", "127.0.0.1")  # only Caddy, on the same machine
 PORT = int(os.environ.get("TS_PORT", "8000"))
 PUBLIC_URL = os.environ.get("TS_PUBLIC_URL", "")  # set when behind the HTTPS proxy, e.g. https://timesheet.example.com
 WHISPER_MODEL = os.environ.get("TS_WHISPER", "large-v3")  # not large-v3-turbo: turbo can't translate
-LLM_MODEL = os.environ.get("TS_LLM", "qwen2.5:14b")  # 7B called tools "clients" and missed blockers in monthly summaries
+# Bake-off on the demo data, 16 Nov: only gemma4:12b invented nothing and got every task check right, at about twice
+# the speed of qwen2.5:14b (which listed tools nobody named). qwen3:8b and qwen3.5:9b missed blockers.
+LLM_MODEL = os.environ.get("TS_LLM", "gemma4:12b")
 OLLAMA_URL = os.environ.get("TS_OLLAMA", "http://127.0.0.1:11434")
 IST = timezone(timedelta(hours=5, minutes=30))  # ponytail: IST has no DST, so a fixed offset is exact
 MAX_AUDIO = 50 * 1024 * 1024
@@ -72,8 +74,10 @@ PROMPTS = {
         "(speech-to-text translated to English; it may contain recognition errors). "
         "Write these headings in this order, skipping any heading with nothing under it:\n"
         "Clients / projects:\nDeliverables:\nTools used:\nBlockers / pending:\n"
-        # Without this a fixed blocker vanished from the day summary, so the monthly one kept it open (tested 16 Nov).
-        "If the input says something that was blocked or pending is now sorted (for example 'got access'), "
+        # Without this a fixed blocker vanished from the day summary, so the monthly one kept it open: "got access"
+        # (Qwen 2.5) and "Jewellery ad approved" (Gemma 4, Qwen 2.5), tested 16 Nov.
+        "Say what each blocker is about (for example 'Waiting for client approval of the jewellery ad'). "
+        "If the input says something was approved, sorted or unblocked (for example 'client approved', 'got access'), "
         "put it under Blockers / pending as 'Resolved: …'.\n"
         f"Bullets under each heading. Under 120 words. {_FORMAT}"),
     "month": (
@@ -97,7 +101,8 @@ PROMPTS = {
 }
 PROMPTS["preview"] = PROMPTS["day"]
 # The AI "task done?" check. IDs are written T12 so numbers inside titles ("3 variants") can't pass for an ID.
-# Tested on qwen2.5:14b: 30/30 right on 10 notes x 3 runs, once "Next ..." sentences are removed first (see check_tasks).
+# Tested on gemma4:12b: 36/36 right on 12 notes x 3 runs (qwen2.5:14b 33/36), once "Next ..." sentences are removed
+# first (see check_tasks).
 TASK_CHECK = (
     "You check an employee's work update against their open tasks. The update is speech-to-text translated to English. "
     "Reply with the IDs of the tasks the update clearly says are already finished (done, completed, delivered or sent), "
@@ -415,7 +420,8 @@ def llm(system, user):
     need = (len(system) + len(user)) // 3 + 1500
     ctx = next((c for c in (8192, 16384, 32768) if need <= c), None)
     if not ctx: raise ValueError("too much text for one summary (more than ~100 people?)")
-    body = json.dumps({"model": LLM_MODEL, "stream": False, "keep_alive": "30m",
+    # think: False so a reasoning model (Qwen3, Qwen3.5, Gemma 4) answers directly; models without it accept it too.
+    body = json.dumps({"model": LLM_MODEL, "stream": False, "keep_alive": "30m", "think": False,
                        # num_predict caps a runaway answer (seen once: 15+ minutes looping), which would
                        # otherwise block every summary queued behind it. 450 words is ~600 tokens.
                        "options": {"temperature": 0.2, "num_ctx": ctx, "num_predict": 1500},
