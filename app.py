@@ -63,7 +63,8 @@ I wrote two scripts. I finished the shoe reel CTA. I'm blocked on Figma access. 
 # (otherwise it lists "the company" as a client).
 _CONTEXT = "Background: the team makes AI ad films and AI-generated content for client brands. "
 _FORMAT = ("Use ONLY facts stated in the input. A client or project must be named in the input; never list the team's "
-           "own company as a client. List a tool only if the input names it, and a blocker only if the input says "
+           "own company as a client, and never list a tool (Midjourney, Kling, Runway, ChatGPT, Figma and the like) "
+           "as a client or project. List a tool only if the input names it, and a blocker only if the input says "
            "something is pending, blocked or waiting. Plain text; the only markdown allowed is '- ' bullets.")
 PROMPTS = {
     "day": (
@@ -71,6 +72,9 @@ PROMPTS = {
         "(speech-to-text translated to English; it may contain recognition errors). "
         "Write these headings in this order, skipping any heading with nothing under it:\n"
         "Clients / projects:\nDeliverables:\nTools used:\nBlockers / pending:\n"
+        # Without this a fixed blocker vanished from the day summary, so the monthly one kept it open (tested 16 Nov).
+        "If the input says something that was blocked or pending is now sorted (for example 'got access'), "
+        "put it under Blockers / pending as 'Resolved: …'.\n"
         f"Bullets under each heading. Under 120 words. {_FORMAT}"),
     "month": (
         f"{_CONTEXT}You write a monthly work overview of one employee for their manager. The input is their daily "
