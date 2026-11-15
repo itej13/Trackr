@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Turns a fresh Ubuntu 22.04/24.04 server into a running Timesheet. Safe to run again: that is also how you update.
 #
-#   sudo git clone https://github.com/itej13/voice-timesheet.git /opt/timesheet
+#   Clone git@github.com:itej13/Trackr.git to /opt/timesheet first: it's private, so see README "Deploy to a server"
+#   for the server's read-only deploy key.
 #   sudo /opt/timesheet/deploy/setup.sh                          # address: <server-ip>.sslip.io
 #   sudo /opt/timesheet/deploy/setup.sh timesheet.example.com    # your own domain (point its DNS here first)
 #

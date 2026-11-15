@@ -1,10 +1,10 @@
-# Timesheet (v2, online)
+# Timesheet (v3)
 
 Employees record a voice note about their day, in Hindi, English or both. The server turns it into English text; they check it, fix anything misheard, and submit. Admins see each person's transcripts, a summary of each day, a month calendar per person, and monthly summaries per person and for the whole company.
 
 Everything runs on one server you control. Speech-to-text is Whisper large-v3 (faster-whisper) and summaries come from Qwen 2.5 14B via Ollama, both on that server, so no transcript goes to an outside AI service. Data is a SQLite file. Two optional extras change what leaves the server: the **Google Sheet** keeps a copy of people, tasks, transcripts and day summaries in your Google account, and voice notes sent through **Slack** stay in Slack too. Caddy in front provides HTTPS with a trusted certificate.
 
-Version 1 (fully offline, on one Mac) is the git tag `v1.0`.
+This repo (Trackr) is the working tool; the tags `v1.0`, `v2.0` and `v3.0` mark each version. Version 1, fully offline on one Mac, also lives on as the separate baseline repo `itej13/voice-timesheet`, a template for new projects.
 
 ```
  Phones / laptops (installable web app; records with no signal, uploads later)
@@ -20,11 +20,23 @@ Version 1 (fully offline, on one Mac) is the git tag `v1.0`.
 
 You need an Ubuntu 22.04 or 24.04 server you can reach over SSH. Ideally it has an NVIDIA GPU with at least 20 GB of memory (for example an RTX 4090, L4 or A10). Without a GPU it still works but is several times slower; give it at least 24 GB of RAM.
 
+The repo is private, so the server gets its own read-only key (a GitHub "deploy key") for it. On the server:
+
 ```bash
-sudo git clone https://github.com/itej13/voice-timesheet.git /opt/timesheet
+sudo ssh-keygen -t ed25519 -N "" -f /root/.ssh/trackr_deploy
+sudo cat /root/.ssh/trackr_deploy.pub
+```
+
+On GitHub, open the repo's **Settings → Deploy keys → Add deploy key**, paste that line and leave **Allow write access** off. Then, on the server:
+
+```bash
+sudo GIT_SSH_COMMAND="ssh -i /root/.ssh/trackr_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git clone git@github.com:itej13/Trackr.git /opt/timesheet
+sudo git -C /opt/timesheet config core.sshCommand "ssh -i /root/.ssh/trackr_deploy -o IdentitiesOnly=yes"
 sudo /opt/timesheet/deploy/setup.sh
 sudo /opt/timesheet/deploy/ts adduser admin "Your Name" --admin --role Founder
 ```
+
+The second line makes later `git pull`s use the same key.
 
 The setup script installs everything, downloads both models (~12 GB), sets up auto-restart, nightly backups and a firewall, then runs a self-test of both models. It prints the address, for example `https://203-0-113-7.sslip.io`. That's a free name pointing at the server's IP, so HTTPS works without buying a domain.
 
