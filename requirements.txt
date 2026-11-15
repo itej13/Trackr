@@ -1,2 +1,4 @@
 faster-whisper==1.2.1
 av==15.1.0  # faster-whisper 1.2.1 passes an argument PyAV 19 removed
+cryptography==50.0.2  # signs the Google service-account login (Sheets sync); only imported when a sheet is set up
+slack_sdk==3.47.0  # Slack bot (Socket Mode, built-in client: no other packages); only imported when Slack is set up

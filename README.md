@@ -2,7 +2,7 @@
 
 Employees record a voice note about their day, in Hindi, English or both. The server turns it into English text; they check it, fix anything misheard, and submit. Admins see each person's transcripts, a summary of each day, a month calendar per person, and monthly summaries per person and for the whole company.
 
-Everything runs on one server you control. Speech-to-text is Whisper large-v3 (faster-whisper) and summaries come from Qwen 2.5 14B via Ollama, both on that server, so no transcript goes to an outside AI service. Data is a SQLite file. Caddy in front provides HTTPS with a trusted certificate.
+Everything runs on one server you control. Speech-to-text is Whisper large-v3 (faster-whisper) and summaries come from Qwen 2.5 14B via Ollama, both on that server, so no transcript goes to an outside AI service. Data is a SQLite file. Two optional extras change what leaves the server: the **Google Sheet** keeps a copy of people, tasks, transcripts and day summaries in your Google account, and voice notes sent through **Slack** stay in Slack too. Caddy in front provides HTTPS with a trusted certificate.
 
 Version 1 (fully offline, on one Mac) is the git tag `v1.0`.
 
@@ -68,7 +68,9 @@ ollama pull qwen2.5:14b
 - **Audio is deleted** as soon as it's been transcribed. Only text is stored.
 - **Comments** are visible to admins only.
 - **Summaries:** day summaries are written automatically. Monthly and company summaries are written when an admin clicks Generate or Refresh.
-- **Glossary** (admin): tool names, client names and jargon. Whisper uses it to spell them right, so add your clients' names here.
+- **Settings** (admin): the **glossary** of tool names, client names and jargon (Whisper uses it to spell them right, so add your clients' names here), and the **speaking guide** shown on top of everyone's Today screen.
+- **Tasks:** admins give tasks to people (Tasks page); each person sees theirs under **My tasks** and taps Start or Done. After a voice note, the AI checks it against that person's open tasks and may ask "Looks like you finished X. Mark it done?". Nothing changes until they tap Mark done.
+- **Reports** (admin): any date range up to 92 days, one person or everyone: who logged which days, each day's summary and exact words, and a summary of the range on request.
 - **Security:** the app and Ollama only listen inside the server, and the firewall allows only SSH and web traffic. Passwords need at least 10 characters. Logins lock for 15 minutes after 5 wrong passwords for one ID, or 50 from one address. Pages are served with strict browser security headers.
 
 ## Settings
@@ -86,13 +88,84 @@ ollama pull qwen2.5:14b
 | `TS_LLM` | `qwen2.5:14b` | Any Ollama model. `qwen2.5:7b` is twice as fast, but in tests its monthly summaries listed tools as clients and missed open blockers |
 | `TS_OLLAMA` | `http://127.0.0.1:11434` | |
 
+## Google Sheet (optional)
+
+A Google Sheet can be the admins' control panel. **People** and **Tasks** sync both ways about once a minute: edit a name, role, Admin/Active, work email, or a task's fields there, or add rows. **Entries** and **Day summaries** are read-only copies. The app keeps working when Google is down.
+
+- **Passwords:** type one in **New password**; the app sets it at the next sync, clears the cell and writes "Password set" in **Sync note**. Google's version history still keeps what was typed, so share the sheet with admins only.
+- **Deleting a row** deactivates that person or cancels that open task. More than 5 rows gone from a tab at once is treated as an accident, and they're put back.
+- **A row the app can't use** (unknown login ID, bad date, password under 10 characters, …) is skipped as a whole, with the reason in **Sync note**. If the app and the sheet changed the same cell between syncs, the app's value wins and Sync note says so.
+
+**Set it up** (once, about 10 minutes):
+
+1. Create an empty Google Sheet, in a company Google account if you have one. Share it only with admins.
+2. Open https://console.cloud.google.com, create a project (e.g. "timesheet-sync"), then **APIs & Services → Library → Google Sheets API → Enable**.
+3. **IAM & Admin → Service accounts → Create service account** (e.g. "timesheet-sync"). It needs no roles: skip that step.
+4. Open the new service account, **Keys → Add key → Create new key → JSON**. A file downloads. If Google refuses, your Google Workspace organisation blocks key creation: organisations created on or after 3 May 2024 do by default (`iam.disableServiceAccountKeyCreation`). Someone with the *Organization Policy Administrator* role can allow it for this one project.
+5. In the sheet, **Share** it with the service account's email (`…@….iam.gserviceaccount.com`, also shown in the app) as **Editor**.
+6. Put the key on the server, readable by the app only, then delete the downloaded copy:
+   ```bash
+   sudo install -o root -g timesheet -m 640 key.json /var/lib/timesheet/google-key.json
+   ```
+   On your own computer it goes in `data/google-key.json`. Never commit it.
+7. In the app: **Settings → Google Sheet**, paste the sheet's link, **Save**. The tabs are created and filled within a minute.
+
+## Slack (optional)
+
+People can send their update as a voice note in a direct message to the **Timesheet** bot: a Slack audio clip or an audio file. It goes through the same steps as a recording in the app. The bot answers in the thread with what it heard, the summary and a **Submit** button, plus "Looks like you finished X. Mark it done?" when that applies. In the app the entry shows "via Slack". A message without audio gets the speaking guide back.
+
+- **Who is who:** a Slack account is matched to a person by **work email** (Team → Edit). If nobody matches, the note waits under **Team → Slack notes waiting for a person** until an admin links that Slack account. Such notes aren't downloaded until then.
+- **Same rules as the app:** today's notes can be submitted until midnight; a note from an earlier day goes in as submitted; the audio is deleted from our server once it's text. It stays in Slack under your workspace's file retention settings.
+- **No public address needed:** the server connects out to Slack (Socket Mode), so it also works on a laptop.
+
+**Set it up** (a Slack workspace owner or admin, about 10 minutes):
+
+1. Open https://api.slack.com/apps?new_app=1, choose to create the app **from a manifest**, pick your workspace, paste this, then **Next → Create**:
+   ```yaml
+   display_information:
+     name: Timesheet
+     description: Send a voice note about your day; it goes into your timesheet.
+   features:
+     app_home:
+       home_tab_enabled: false
+       messages_tab_enabled: true
+       messages_tab_read_only_enabled: false
+     bot_user:
+       display_name: Timesheet
+       always_online: true
+   oauth_config:
+     scopes:
+       bot: [chat:write, im:history, files:read, users:read, users:read.email]
+   settings:
+     event_subscriptions:
+       bot_events: [message.im]
+     interactivity:
+       is_enabled: true
+     org_deploy_enabled: false
+     socket_mode_enabled: true
+     token_rotation_enabled: false
+   ```
+2. **Basic Information → App-Level Tokens → Generate Token and Scopes**: any name, scope `connections:write`. Copy the `xapp-…` token.
+3. **Install App → Install to Workspace → Allow**. Then **OAuth & Permissions**: copy the **Bot User OAuth Token** (`xoxb-…`).
+4. Put both tokens on the server, readable by the app only, and restart:
+   ```bash
+   sudo install -o root -g timesheet -m 640 /dev/null /var/lib/timesheet/slack.env
+   sudo nano /var/lib/timesheet/slack.env
+   ```
+   Write two lines, `SLACK_APP_TOKEN=xapp-…` and `SLACK_BOT_TOKEN=xoxb-…`, save, then:
+   ```bash
+   sudo systemctl restart timesheet
+   ```
+   On your own computer they go in `data/slack.env`. Never commit them or paste them into a chat.
+5. In the app, **Settings → Slack** should say *Connected*. Fill in everyone's **work email** on the Team page, then send the bot "hi" in Slack: it replies with the speaking guide.
+
 ## Check
 
 ```bash
 .venv/bin/python test_app.py
 ```
 
-This covers access rules, drafts, the midnight lock, late uploads, edits, summaries, the login throttle and security headers, with the models faked.
+This covers access rules, drafts, the midnight lock, late uploads, edits, summaries, reports, tasks and the "task done?" check, the Google Sheet sync and the Slack bot (against stand-ins for Google and Slack), database upgrades, the login throttle and security headers, with the models faked.
 
 ## Known limits
 

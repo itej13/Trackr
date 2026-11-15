@@ -79,6 +79,7 @@ input[type=checkbox] { width: auto; }
 .badge.bad { background: var(--bad-bg); color: var(--bad); }
 .badge.draft { background: var(--draft-bg); color: var(--draft); }
 .entry.draft { border-color: var(--draft); }
+.guide-text { white-space: pre-wrap; margin-top: 8px; font-size: 14px; }
 .transcript, .summary { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 6px; }
 details > summary { cursor: pointer; color: var(--muted); font-size: 14px; }
 details.card > summary { color: var(--text); font-weight: 600; }
@@ -111,3 +112,25 @@ details.card > summary { color: var(--text); font-weight: 600; }
 
 .comment { margin-top: 10px; }
 .comment + .comment { border-top: 1px solid var(--line); padding-top: 10px; }
+
+.chip { padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; font-size: 14px; text-decoration: none; color: var(--muted); }
+.chip.on { background: var(--ink); border-color: var(--ink); color: var(--ink-text); }
+.presets { margin-top: 0; }
+.range-fields { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+select { font: inherit; width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
+.rday.row > :first-child { margin-right: auto; }
+.rday .entry { border: 0; border-top: 1px solid var(--line); border-radius: 0; padding: 10px 0 0; margin-top: 10px; }
+.strip { display: flex; flex-wrap: wrap; gap: 3px; width: 100%; }
+.sq { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); }
+.sq.has { background: var(--ok); border-color: var(--ok); }
+.sq.missed { background: var(--bad-bg); border-color: transparent; }
+.sq.future { border-style: dashed; opacity: .5; }
+
+.task { padding: 10px 0; border-top: 1px solid var(--line); }
+.task:first-of-type { margin-top: 8px; }
+.task .actions { margin-top: 6px; }
+.task-info { display: grid; gap: 2px; min-width: 0; margin-right: auto; }
+.task-details { white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-row select.status { width: auto; }
+.task-row .edit[open] { width: 100%; }
+.suggest { border-color: var(--ok); background: var(--ok-bg); }
