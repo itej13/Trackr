@@ -26,7 +26,6 @@ This part is for the person putting the app on a server. Do the steps in order; 
 | Who | What | When |
 |---|---|---|
 | Admin (you) | Prepare the server, install, create logins, connect Slack and the sheet | Steps 1–8 |
-| Owner of this GitHub repo | Add the server's deploy key (on a personal repo only the owner can) | Step 2 |
 | A Slack workspace owner or admin | Create and install the Slack app (can be you, if you are one) | Step 6, optional |
 | A Google Workspace super admin | Allow one service-account key for one Cloud project | Step 7, optional |
 
@@ -46,21 +45,11 @@ This part is for the person putting the app on a server. Do the steps in order; 
 
 ## 2. Get the code onto the server
 
-The repo is private, so the server gets its own read-only key for it (a GitHub "deploy key"). Create it on the server:
-
 ```bash
-sudo ssh-keygen -t ed25519 -N "" -f /root/.ssh/trackr_deploy
-sudo cat /root/.ssh/trackr_deploy.pub
+sudo git clone https://github.com/itej13/Trackr.git /opt/timesheet
 ```
 
-Send the printed line (it starts with `ssh-ed25519`) to the **owner of this repo**. It's a public key, so it's safe to send by chat. The owner adds it under the repo's **Settings → Deploy keys → Add deploy key** (title: the server's name), with **Allow write access** left off. Then clone:
-
-```bash
-sudo GIT_SSH_COMMAND="ssh -i /root/.ssh/trackr_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git clone git@github.com:itej13/Trackr.git /opt/timesheet
-sudo git -C /opt/timesheet config core.sshCommand "ssh -i /root/.ssh/trackr_deploy -o IdentitiesOnly=yes"
-```
-
-The second line makes later updates (`git pull`) use the same key. Keep the code in `/opt/timesheet`: the app's service can't read home folders.
+Keep the code in `/opt/timesheet`: the app's service can't read home folders.
 
 **Check:** `ls /opt/timesheet` shows `app.py`, `deploy/`, `static/`.
 
