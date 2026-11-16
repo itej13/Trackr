@@ -388,8 +388,9 @@ def run_whisper(path):
     """Speech in Hindi, English or Hinglish -> English text."""
     # ponytail: Whisper only reads the last ~220 tokens of the prompt, so a very long glossary loses its start
     # The closing "." matters: Whisper copies the prompt's style, and a bare comma list made it drop every full stop.
+    # beam_size=1: about 30% faster on a CPU than the default 5, same English on our Hindi test note (16 Nov).
     segments, _ = load_whisper().transcribe(str(path), task="translate", initial_prompt="Glossary: " + glossary() + ".",
-                                            vad_filter=True)
+                                            vad_filter=True, beam_size=1)
     return " ".join(s.text.strip() for s in segments).strip()
 
 
@@ -402,11 +403,11 @@ def transcribe(eid):
     except Exception as err:
         traceback.print_exc()
         ex("UPDATE entries SET status='failed', error=? WHERE id=?", f"Transcription failed: {err}"[:300], eid)
-        return slack_reply(eid)  # audio is kept, so the next server start retries it
+        return slack_jobs.put(eid)  # audio is kept, so the next server start retries it
     audio.unlink(missing_ok=True)  # audio isn't kept once we have the text
     if not text:
         ex("UPDATE entries SET status='failed', error='No speech detected. Discard it and record again.' WHERE id=?", eid)
-        return slack_reply(eid)
+        return slack_jobs.put(eid)
     # A past day is locked, so it can't be reviewed any more (recorded offline, uploaded late): keep it as said.
     ex("UPDATE entries SET status=?, transcript=? WHERE id=?", "draft" if e["day"] == ist_day() else "submitted", text, eid)
     touch(e["user_id"], e["day"])
@@ -473,12 +474,16 @@ def build(kind, uid, period):
     h = digest(src)
     row = q1("SELECT src FROM summaries WHERE kind=? AND user_id=? AND period=?", kind, uid, period)
     if row and row["src"] == h: return
-    when = {"month": "Month", "company": "Month", "range": "Period", "range_all": "Period"}.get(kind, "Date")
+    # Same prompt, same notes: when someone submits without changing anything, their preview already is the day
+    # summary. Saves one model call per person per day, which is minutes on a server without a GPU.
+    same = q1("SELECT text FROM summaries WHERE kind='preview' AND user_id=? AND period=? AND src=?",
+              uid, period, h) if kind == "day" else None
+    when ={"month": "Month", "company": "Month", "range": "Period", "range_all": "Period"}.get(kind, "Date")
     header = f"{when}: {period.replace('..', ' to ')}\n\n"
     if kind not in ("company", "range_all"):
         u = q1("SELECT name, role FROM users WHERE id=?", uid)
         header = f"Employee: {u['name']} ({u['role'] or 'role not set'})\n" + header
-    text = llm(PROMPTS[kind], header + "\n\n".join(src))
+    text = same["text"] if same else llm(PROMPTS[kind], header + "\n\n".join(src))
     ex("INSERT OR REPLACE INTO summaries VALUES(?,?,?,?,?,?)", kind, uid, period, text, h, now())
 
 
@@ -513,17 +518,19 @@ def run_build(key):
     except Exception as e:
         llm_errors[key] = f"Summary failed ({e}). Is Ollama running with {LLM_MODEL}?"[:300]
         raise
-    finally:  # the task check is the last step for a note: if it came from Slack, its reply now shows the result
-        if key[0] == "tasks": slack_reply(key[1])
+    finally:  # a note's last step is its task check, a day's its preview: Slack replies now show the result
+        if key[0] == "tasks": slack_jobs.put(key[1])
+        elif key[0] == "preview": slack_refresh(key[1], key[2])
 
 
 whisper_jobs, llm_jobs = Jobs(transcribe), Jobs(run_build)
 
 
 def touch(uid, day):
-    """Entries for (uid, day) changed: refresh the admin's day summary and the employee's draft preview."""
+    """Entries for (uid, day) changed: refresh the admin's day summary, the employee's draft preview and Slack replies."""
     llm_jobs.put(("day", uid, day))
     llm_jobs.put(("preview", uid, day))
+    slack_refresh(uid, day)  # now for the new text and status; again once the preview is rewritten
 
 
 def summary_view(kind, uid, period, auto=True):
@@ -771,6 +778,8 @@ def submit_entry(h, eid): submit(h.user["id"], eid)
 def delete_entry(h, eid):
     e = own_entry(h.user["id"], eid, today_only=False)
     if e["status"] != "failed" and e["day"] != ist_day(): raise HTTPError(403, "Only today's entries can be changed")
+    if n := q1("SELECT channel, reply_ts FROM slack_notes WHERE entry_id=?", e["id"]):  # gone with the entry
+        slack_jobs.put((n["channel"], n["reply_ts"]))
     ex("DELETE FROM entries WHERE id=?", e["id"])
     (AUDIO_DIR / e["client_id"]).unlink(missing_ok=True)
     touch(e["user_id"], e["day"])
@@ -1344,6 +1353,15 @@ def run_sync(_=None):
 sheet_jobs = Jobs(run_sync)
 
 
+def nightly_loop():
+    """Without a GPU a monthly summary takes minutes, so write them at night, before an admin opens one."""
+    while True:
+        time.sleep(3600)  # ponytail: hourly wake-up, so it runs once between 1:00 and 2:00 IST
+        if datetime.now(IST).hour == 1:
+            sweep()  # yesterday's drafts count as submitted now
+            llm_jobs.put(("company", 0, ist_day(now() - 86400)[:7]))  # also refreshes each day and month summary
+
+
 def sheet_loop():
     while True:
         if sheet_config(): sheet_jobs.put("sync")
@@ -1507,6 +1525,24 @@ def slack_reply(eid, problem=None):
     except Exception: traceback.print_exc()  # Slack being down mustn't stop transcriptions or summaries
 
 
+def slack_update(key):
+    """The Slack queue: an entry ID (show it as it is now), or (channel, reply ts) of a note deleted in the app."""
+    if isinstance(key, int): return slack_reply(key)
+    if slack_web: slack_web.chat_update(channel=key[0], ts=key[1], text="Deleted in the app.", blocks=[])
+
+
+# Its own thread, so the app, Whisper and the summaries never wait on Slack. A waiting ID isn't queued twice.
+slack_jobs = Jobs(slack_update)
+
+
+def slack_refresh(uid, day):
+    """Each Slack reply about (uid, day): it shows the entry and the day's summary, and either may have changed."""
+    if slack_web:
+        for r in q("SELECT n.entry_id FROM slack_notes n JOIN entries e ON e.id=n.entry_id WHERE e.user_id=? AND e.day=?",
+                   uid, day):
+            slack_jobs.put(r[0])
+
+
 def slack_action(p):
     """A button in one of the bot's replies. Same rules as the app: own entries, today only, the person decides."""
     u = q1("SELECT * FROM users WHERE slack_id=? AND active=1", p.get("user", {}).get("id"))
@@ -1655,9 +1691,10 @@ def main():
     if cmd == ["backup"]: return backup(args[0] if args else DB_PATH.parent / "backups")
     preflight()
     requeue()
-    whisper_jobs.start(); llm_jobs.start(); sheet_jobs.start()
+    whisper_jobs.start(); llm_jobs.start(); sheet_jobs.start(); slack_jobs.start()
     start_slack()  # does nothing without the Slack tokens
     threading.Thread(target=sheet_loop, daemon=True).start()  # does nothing until a Google Sheet is set up
+    threading.Thread(target=nightly_loop, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Timesheet is running on http://{HOST}:{PORT}" + (f", public address {PUBLIC_URL}" if PUBLIC_URL else ""))
     if not q1("SELECT 1 FROM users WHERE is_admin=1"):

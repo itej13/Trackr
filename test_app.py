@@ -9,12 +9,14 @@ import app  # noqa: E402  (must come after TS_DB is set)
 
 app.run_whisper = lambda path: "Rendered three Kling variants for the shoe client."
 TASK_REPLY, task_calls = ["none"], []  # what the fake model answers to the "task done?" check, and what it was asked
+summary_calls = []
 
 
 def fake_llm(system, user):
     if system == app.TASK_CHECK:
         task_calls.append(user)
         return TASK_REPLY[0]
+    summary_calls.append(user)
     return f"summary of {user.count(chr(10))} lines"
 
 
@@ -45,8 +47,8 @@ def client(username, password):
 
 
 def drain():  # run the background jobs inline
-    while not (app.whisper_jobs.q.empty() and app.llm_jobs.q.empty()):
-        for jobs in (app.whisper_jobs, app.llm_jobs):
+    while not (app.whisper_jobs.q.empty() and app.llm_jobs.q.empty() and app.slack_jobs.q.empty()):
+        for jobs in (app.whisper_jobs, app.llm_jobs, app.slack_jobs):
             while not jobs.q.empty():
                 key = jobs.q.get(); jobs.queued.discard(key); jobs.fn(key)
 
@@ -72,8 +74,11 @@ assert boss("GET", f"/api/day?user={emp}")["entries"] == [], "admin must not see
 
 # submit -> the admin sees the entry and the day summary; comments are admin-only
 e1("PATCH", f"/api/entries/{eid}", {"transcript": "Fixed: three Kling variants."})
+drain()
+before = len(summary_calls)
 e1("POST", f"/api/entries/{eid}/submit")
 drain()
+assert len(summary_calls) == before, "submitting unchanged notes must reuse the preview, not call the model again"
 seen = boss("GET", f"/api/day?user={emp}")
 assert seen["entries"][0]["transcript"] == "Fixed: three Kling variants." and not seen["entries"][0]["edited"]
 assert seen["summary"]["text"] and not seen["summary"]["stale"]
@@ -454,6 +459,18 @@ press("UNEHA", "submit", str(eid["id"]))
 assert status("slack:F1") == "submitted" and buttons(slack.updates[-1]) == []
 press("UNEHA", "submit", str(eid["id"]))
 assert "Couldn't do that: This entry isn't a draft" in json.dumps(slack.updates[-1]["blocks"])
+
+# changed in the app instead: its Slack reply follows, so it never shows old text or a stale Submit button
+dm("UNEHA", [clip("F5")]); drain()
+f5 = app.q1("SELECT entry_id, reply_ts FROM slack_notes WHERE entry_id=(SELECT id FROM entries WHERE client_id='slack:F5')")
+reply = lambda: [u for u in slack.updates if u["ts"] == f5["reply_ts"]][-1]
+neha = client("neha", "another-pass-1")
+neha("PATCH", f"/api/entries/{f5['entry_id']}", {"transcript": "Fixed in the app."}); drain()
+assert "Fixed in the app." in reply()["text"] and "submit" in buttons(reply())
+neha("POST", f"/api/entries/{f5['entry_id']}/submit"); drain()
+assert buttons(reply()) == [] and "Submitted." in json.dumps(reply()["blocks"])
+neha("DELETE", f"/api/entries/{f5['entry_id']}"); drain()
+assert reply()["text"] == "Deleted in the app." and reply()["blocks"] == []
 dm("UNEHA", [clip("F2")], ts=app.now() - 86400); drain()
 assert status("slack:F2") == "submitted", "a note from yesterday goes in as it was said"
 
@@ -462,7 +479,7 @@ app.ex("UPDATE users SET email='emp@example.com' WHERE username='emp'")
 dm("UEMP", [clip("F3")])
 assert "deactivated" in slack.posts[-1]["text"] and not app.q1("SELECT 1 FROM entries WHERE client_id='slack:F3'")
 dm("UNEW", [clip("F4")])
-assert "couldn't find" in slack.posts[-1]["text"] and len(downloads) == 2
+assert "couldn't find" in slack.posts[-1]["text"] and len(downloads) == 3  # F1, F2, F5: not F3 or F4
 assert [(w["slack_user"], w["email"], w["notes"]) for w in boss("GET", "/api/slack")["waiting"]] == [("UNEW", "new@example.com", 1)]
 other("GET", "/api/slack", expect=403)
 boss("POST", "/api/slack/link", {"slack_user": "UNEW", "user": user("neha")["id"]}, expect=409)  # neha is UNEHA

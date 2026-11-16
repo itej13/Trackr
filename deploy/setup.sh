@@ -19,10 +19,16 @@ say() { printf '\n== %s\n' "$*"; }
 case "$APP_DIR" in /root/* | /home/*) echo "Clone the repo to /opt/timesheet: the service can't read home folders."; exit 1 ;; esac
 export DEBIAN_FRONTEND=noninteractive
 
+say "Other websites on this server"
+# If something else (nginx, Apache, a Docker container) already serves ports 80/443, there's a website here already.
+# Then leave its HTTPS setup and firewall alone: no Caddy, no ufw. Its web server forwards our address to the app.
+OTHER_WEB="$(ss -Htlnp '( sport = :80 or sport = :443 )' | grep -v '"caddy"' || true)"
+if [ -n "$OTHER_WEB" ]; then echo "$OTHER_WEB" | sed 's/^/  /'; echo "Not touching it."; else echo "None."; fi
+
 say "System packages"
 apt-get update -q
 apt-get install -y -q python3-venv git curl gnupg ufw pciutils unattended-upgrades
-if ! command -v caddy >/dev/null; then  # Caddy serves HTTPS and renews the certificate by itself
+if [ -z "$OTHER_WEB" ] && ! command -v caddy >/dev/null; then  # Caddy serves HTTPS and renews the certificate by itself
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
   apt-get update -q && apt-get install -y -q caddy
@@ -85,7 +91,18 @@ chgrp timesheet "$ENV_FILE" && chmod 640 "$ENV_FILE"
 
 say "Models: $LLM_MODEL (~8 GB) and Whisper large-v3 (~3 GB). The first run downloads them."
 command -v ollama >/dev/null || curl -fsSL https://ollama.com/install.sh | sh  # Ollama listens on 127.0.0.1 only
-systemctl enable --now ollama >/dev/null
+# The AI gets the processor only when nothing else wants it, so a website on the same server stays fast. If memory
+# runs out, the kernel stops the AI first (it restarts by itself); one request and one model at a time.
+mkdir -p /etc/systemd/system/ollama.service.d
+cat > /etc/systemd/system/ollama.service.d/timesheet.conf <<EOF
+[Service]
+CPUWeight=20
+Nice=10
+OOMScoreAdjust=500
+Environment=OLLAMA_NUM_PARALLEL=1 OLLAMA_MAX_LOADED_MODELS=1
+EOF
+systemctl daemon-reload
+systemctl enable ollama >/dev/null && systemctl restart ollama
 for _ in $(seq 30); do ollama list >/dev/null 2>&1 && break; sleep 1; done
 ollama pull "$LLM_MODEL"
 runuser -u timesheet -- env HF_HOME="$DATA_DIR/models" "$PY" -c "from faster_whisper import download_model; download_model('large-v3')" >/dev/null
@@ -104,6 +121,10 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$PY $APP_DIR/app.py
 Restart=always
 RestartSec=3
+# Whisper runs inside the app: same low priority as Ollama, so other sites on this server come first.
+CPUWeight=20
+Nice=10
+OOMScoreAdjust=500
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -134,7 +155,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-cat > /etc/caddy/Caddyfile <<EOF
+[ -n "$OTHER_WEB" ] || cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
 	encode zstd gzip
 	request_body {
@@ -154,15 +175,20 @@ systemctl daemon-reload
 systemctl enable timesheet timesheet-backup.timer >/dev/null 2>&1
 systemctl restart timesheet
 systemctl start timesheet-backup.timer
-systemctl reload caddy 2>/dev/null || systemctl restart caddy
-
-say "Firewall: only SSH, HTTP and HTTPS are reachable"
-# Allow SSH on whatever port it really uses before switching the firewall on, so this can't lock you out.
-for port in $( (sshd -T 2>/dev/null | awk '/^port /{print $2}'; echo 22) | sort -u); do ufw allow "$port/tcp" >/dev/null; done
-ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null
-ufw --force enable >/dev/null && ufw status | sed -n '1,12p'
+if [ -z "$OTHER_WEB" ]; then
+  systemctl reload caddy 2>/dev/null || systemctl restart caddy
+  say "Firewall: only SSH, HTTP and HTTPS are reachable"
+  # Allow SSH on whatever port it really uses before switching the firewall on, so this can't lock you out.
+  for port in $( (sshd -T 2>/dev/null | awk '/^port /{print $2}'; echo 22) | sort -u); do ufw allow "$port/tcp" >/dev/null; done
+  ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null
+  ufw --force enable >/dev/null && ufw status | sed -n '1,12p'
+fi
 
 say "Done"
+if [ -n "$OTHER_WEB" ]; then
+  echo "The web server already on ports 80/443 must forward https://$DOMAIN to http://127.0.0.1:8000"
+  echo "(allow uploads up to 60 MB, pass X-Forwarded-For). Until then the app runs but isn't reachable."
+fi
 echo "Open:          https://$DOMAIN   (the certificate is fetched on the first visit; allow a minute)"
 echo "First admin:   sudo $APP_DIR/deploy/ts adduser admin \"Your Name\" --admin"
 echo "Logs:          journalctl -u timesheet -f"

@@ -62,6 +62,8 @@ sudo /opt/timesheet/deploy/setup.sh timesheet.yourcompany.com  # or your own dom
 
 It installs the system packages, Python packages, Ollama, Caddy (for HTTPS) and the GPU libraries; downloads both models; sets up the app as a service that restarts by itself, a nightly backup and a firewall that lets in only SSH and web traffic; then runs both models once as a self-test. It's safe to run again: that's also how you update.
 
+**A server that already hosts a website** (something else answers on ports 80/443): the script sees it and leaves that web server and the firewall alone, without installing Caddy. Afterwards, set that web server to forward the timesheet's address to `http://127.0.0.1:8000`, allowing uploads up to 60 MB and passing `X-Forwarded-For`. The AI runs at low priority, so it uses the processor only when the website doesn't need it.
+
 - If it says **"NVIDIA GPU found but its driver isn't installed … Reboot"**, run `sudo reboot`, SSH back in and run the same command again.
 - At the end it prints the address, for example `https://203-0-113-7.sslip.io`. The HTTPS certificate is fetched on the first visit, so allow a minute.
 - If it ends with **"The self-test failed"**, the site works but notes won't be transcribed. See Troubleshooting.
@@ -276,6 +278,6 @@ This covers access rules, drafts, the midnight lock, late uploads, edits, summar
 - **Day and per-person monthly summaries are reliable** in tests: right clients and tools, and work redone later isn't reported as still open.
 - **The company summary is an overview, not a ledger.** In a 50-person test it kept every client and every one-off problem, but per-client counts were made up and one blocker was put under the wrong client. Check numbers in each person's monthly summary.
 - The company summary is one background job that first writes any missing monthly summaries. For 40–50 people on a GPU expect about 10 minutes, and day summaries wait while it runs.
-- **Without a GPU** everything still works, but transcripts and summaries take minutes instead of seconds, and an evening rush builds a queue.
+- **Without a GPU** everything still works, but transcripts and summaries take minutes instead of seconds, and an evening rush builds a queue. Nobody has to wait for it: a note still in the queue at midnight is kept as submitted. Monthly and company summaries are written between 1 and 2 am, so they're ready in the morning.
 - **Backups stay on the same server** unless the provider's server backups are on (step 1).
 - No password reset by email. An admin sets a new password under **Team → Edit**.
