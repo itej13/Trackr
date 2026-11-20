@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Timesheet v2: runs on one server; the models (Whisper, Gemma via Ollama) run on that server too.
 
-Speech-to-text: faster-whisper. Summaries: Ollama. Storage: SQLite. HTTPS comes from Caddy in front (deploy/setup.sh).
+Speech-to-text: Groq's whisper-large-v3 when data/groq.env has a key, else faster-whisper here. Summaries: Ollama. Storage: SQLite. HTTPS comes from Caddy in front (deploy/setup.sh).
 
   .venv/bin/python app.py                                      # serve on 127.0.0.1:8000
   .venv/bin/python app.py adduser admin "Your Name" --admin    # create a login (asks for the password)
@@ -384,8 +384,58 @@ def load_whisper():
     return _whisper
 
 
+def read_env(path):
+    """KEY=value lines from a secrets file next to the database (slack.env, groq.env); {} if there's none."""
+    if not path.is_file(): return {}
+    return {k.strip(): v.strip() for k, _, v in (ln.partition("=") for ln in path.read_text().splitlines())}
+
+
+# Groq runs the same whisper-large-v3 in seconds; local Whisper is the fallback (no key, refused file, Groq error).
+# Groq docs, checked 20 Nov 2026: POST multipart (file, model, prompt ≤224 tokens, response_format, temperature),
+# reply {"text": ...}; 25 MB per file on the free plan; flac mp3 mp4 mpeg mpga m4a ogg wav webm; 429 when rate-limited.
+# Only whisper-large-v3 translates (turbo can't). The audio leaves the server; see README "Speech-to-text".
+GROQ_ENV = DB_PATH.parent / "groq.env"
+GROQ_URL = "https://api.groq.com/openai/v1/audio/translations"
+GROQ_MAX = 25 * 1024 * 1024
+# Saved recordings have no file name, so tell the format from its first bytes. AIFF (Safari's `say` tests) isn't accepted.
+AUDIO_MAGIC = [(0, b"\x1aE\xdf\xa3", "webm"), (0, b"OggS", "ogg"), (4, b"ftyp", "m4a"), (8, b"WAVE", "wav"),
+               (0, b"fLaC", "flac"), (0, b"ID3", "mp3")]
+
+
+def groq_key(): return os.environ.get("GROQ_API_KEY") or read_env(GROQ_ENV).get("GROQ_API_KEY", "")
+
+
+def groq_translate(data, ext, key):
+    # Groq refuses a prompt over 224 tokens; local Whisper keeps the end of a long list, so do the same.
+    # ponytail: 700 characters is ~175 English tokens; count real tokens if odd names get the prompt refused
+    g = glossary()
+    if len(g) > 700: g = g[-700:].partition(",")[2].strip()
+    b = secrets.token_hex(16)
+    part = lambda name, val: f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode()
+    body = (part("model", "whisper-large-v3") + part("prompt", "Glossary: " + g + ".")
+            + part("response_format", "json") + part("temperature", "0")
+            + f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="note.{ext}"\r\n'
+              f'Content-Type: application/octet-stream\r\n\r\n'.encode() + data + f"\r\n--{b}--\r\n".encode())
+    req = urllib.request.Request(GROQ_URL, body, {"Authorization": "Bearer " + key, "User-Agent": "timesheet",
+                                                  "Content-Type": "multipart/form-data; boundary=" + b})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r: return json.load(r)["text"].strip()
+    except urllib.error.HTTPError as e:  # e.g. 429 rate limit, 413 too large, 401 bad key
+        raise RuntimeError(f"Groq said {e.code}: {e.read()[:200].decode(errors='replace')}") from None
+
+
 def run_whisper(path):
-    """Speech in Hindi, English or Hinglish -> English text."""
+    """Speech in Hindi, English or Hinglish -> English text. Groq first when there's a key, else on this server."""
+    if key := groq_key():
+        data = path.read_bytes()
+        ext = next((x for at, magic, x in AUDIO_MAGIC if data[at:at + len(magic)] == magic), None)
+        if ext and len(data) <= GROQ_MAX:
+            try: return groq_translate(data, ext, key)
+            except Exception as err: print(f"! {err}. Using Whisper on this server instead.", flush=True)
+    return local_whisper(path)
+
+
+def local_whisper(path):
     # ponytail: Whisper only reads the last ~220 tokens of the prompt, so a very long glossary loses its start
     # The closing "." matters: Whisper copies the prompt's style, and a bare comma list made it drop every full stop.
     # beam_size=1: about 30% faster on a CPU than the default 5, same English on our Hindi test note (16 Nov).
@@ -1418,11 +1468,7 @@ slack_web, slack_bot_user = None, None  # the Web API client and the bot's own u
 
 def slack_tokens():
     """(app-level token xapp-…, bot token xoxb-…)."""
-    vals = {}
-    if SLACK_ENV.is_file():
-        for line in SLACK_ENV.read_text().splitlines():
-            k, _, v = line.partition("=")
-            vals[k.strip()] = v.strip()
+    vals = read_env(SLACK_ENV)
     return tuple(os.environ.get(k) or vals.get(k, "") for k in ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"))
 
 
@@ -1659,6 +1705,19 @@ def selftest():
     except Exception as e:
         ok = False
         print(f"FAILED: {e}")
+    if key := groq_key():
+        try:
+            import io, wave
+            print("Groq whisper-large-v3 (used first; the above is the fallback) ...", end=" ")
+            t, buf = time.time(), io.BytesIO()
+            with wave.open(buf, "wb") as w: w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(bytes(32000))
+            groq_translate(buf.getvalue(), "wav", key)  # one second of silence (Groq bills at least 10 s)
+            print(f"ok, {time.time() - t:.0f}s")
+        except Exception as e:
+            ok = False
+            print(f"FAILED: {e}")
+    else:
+        print(f"Groq: no key in {GROQ_ENV}, so every note uses the Whisper above.")
     try:
         print(f"Summaries with {LLM_MODEL} via Ollama ...", end=" ")
         t = time.time()

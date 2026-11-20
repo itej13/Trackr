@@ -7,7 +7,8 @@ from pathlib import Path
 os.environ["TS_DB"] = os.path.join(tempfile.mkdtemp(), "test.db")
 import app  # noqa: E402  (must come after TS_DB is set)
 
-app.run_whisper = lambda path: "Rendered three Kling variants for the shoe client."
+real_run_whisper, app.run_whisper = app.run_whisper, lambda path: "Rendered three Kling variants for the shoe client."
+app.groq_key = lambda: ""  # never reach the real Groq from a test, whatever is in data/groq.env
 TASK_REPLY, task_calls = ["none"], []  # what the fake model answers to the "task done?" check, and what it was asked
 summary_calls = []
 
@@ -522,5 +523,23 @@ assert len(copies) == 1 and sqlite3.connect(copies[0]).execute("SELECT COUNT(*) 
 assert upgrade().returncode == 0 and len(list((old.parent / "backups").glob("*.db"))) == 1, "a second start upgrades nothing"
 c.execute(f"PRAGMA user_version={len(app.MIGRATIONS) + 1}"); c.commit(); c.close()
 assert "newer version" in upgrade().stderr, "old code must refuse a newer database"
+
+# ---------- speech: Groq first, Whisper on this server as the fallback ----------
+sent, f = [], Path(tempfile.mkdtemp()) / "note"
+def fake_groq(data, ext, key):
+    sent.append(ext)
+    if ext == "ogg": raise RuntimeError("Groq said 429: rate limit")
+    return "from groq"
+app.groq_translate, app.local_whisper = fake_groq, lambda path: "from here"
+f.write_bytes(b"\x1aE\xdf\xa3" + b"x" * 2000)
+assert real_run_whisper(f) == "from here" and not sent, "no key: never Groq"
+app.groq_key = lambda: "gsk_test"
+assert real_run_whisper(f) == "from groq" and sent == ["webm"]
+f.write_bytes(b"OggS" + b"x" * 2000)
+assert real_run_whisper(f) == "from here", "a Groq error falls back to this server"
+f.write_bytes(b"FORM\0\0\0\0AIFF" + b"x" * 2000)
+assert real_run_whisper(f) == "from here" and sent == ["webm", "ogg"], "a format Groq refuses isn't sent"
+f.write_bytes(b"\0\0\0\x20ftypM4A " + b"x" * app.GROQ_MAX)
+assert real_run_whisper(f) == "from here" and len(sent) == 2, "over Groq's 25 MB: not sent"
 
 print("all checks passed")
