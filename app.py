@@ -595,6 +595,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.headers["X-Forwarded-For"].split(",")[-1].strip()
         return self.client_address[0]
 
+    def same_origin(self):
+        """CSRF guard. SameSite=Lax isn't enough: sslip.io isn't on the Public Suffix List (checked 20 Nov 2026), so
+        any other *.sslip.io page counts as the same site and the browser would send our cookie with its POSTs.
+        Browsers send Origin on every POST/PUT/PATCH/DELETE; a request without one isn't from a browser page."""
+        origin = self.headers.get("Origin")
+        return not origin or urlparse(origin).netloc == (urlparse(PUBLIC_URL).netloc or self.headers.get("Host"))
+
     def handle_any(self, method):
         url, self.extra, self.token = urlparse(self.path), [], None
         if not url.path.startswith("/api/"):
@@ -608,6 +615,7 @@ class Handler(BaseHTTPRequestHandler):
             self.user = self.session_user()
             if auth and not self.user: raise HTTPError(401, "Please log in")
             if auth == "admin" and not self.user["is_admin"]: raise HTTPError(403, "Admins only")
+            if method != "GET" and not self.same_origin(): raise HTTPError(403, "Request from another site refused")
             sweep()
             self.reply(200, fn(self, *match.groups()) or {"ok": True})
         except HTTPError as e:
@@ -644,6 +652,7 @@ class Handler(BaseHTTPRequestHandler):
     def body(self, limit):
         n = int(self.headers.get("Content-Length") or 0)
         if n > limit: raise HTTPError(413, "Upload is too large")
+        if n < 0: raise HTTPError(400, "Bad request")  # read(-1) would read until the client hangs up, past the limit
         return self.rfile.read(n)
 
     def body_json(self):
@@ -973,6 +982,7 @@ def create_task(f, by):
 def edit_task(h, tid):
     t = q1("SELECT * FROM tasks WHERE id=?", int(tid))
     if not t or not (h.user["is_admin"] or t["assignee_id"] == h.user["id"]): raise HTTPError(404, "Task not found")
+    if t["status"] == "cancelled" and not h.user["is_admin"]: raise HTTPError(403, "Only an admin can change that")
     change_task(t, task_fields(h.body_json(), h.user["is_admin"]))
 
 

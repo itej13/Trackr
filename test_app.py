@@ -192,6 +192,13 @@ record(other, "rec-0008"); drain()  # "other" has an open task, so one call; the
 boss("PATCH", f"/api/tasks/{t_oth}", {"status": "cancelled"})
 record(other, "rec-0009"); drain()
 assert len(task_calls) == calls + 1, "no model call when the person has no open tasks"
+other("PATCH", f"/api/tasks/{t_oth}", {"status": "todo"}, expect=403)  # an admin cancelled it: only an admin reopens it
+
+# CSRF: a write from another site's page is refused (sslip.io isn't a public suffix); our own pages and non-browsers pass
+boss("PUT", "/api/guide", {"text": ""}, {"Origin": "http://evil.sslip.io"}, expect=403)
+boss("PUT", "/api/guide", {"text": ""}, {"Origin": BASE})
+boss("PUT", "/api/guide", {"text": ""})
+boss("POST", "/api/entries", b"", {"Content-Length": "-1", "X-Client-Id": "rec-neg-len"}, expect=400)
 
 # deactivating someone logs them out
 boss("PATCH", f"/api/users/{emp}", {"active": False})
