@@ -464,6 +464,39 @@ def transcribe(eid):
     llm_jobs.put(("tasks", eid))
 
 
+# Summaries go to OpenRouter first when openrouter.env (next to the DB) has a key; Gemma on this server is the fallback
+# (no key, rate limit, provider down). OpenRouter docs, checked 20 Nov 2026: OpenAI-style chat completions, text at
+# choices[0].message.content; an error can come back as HTTP 200 with an "error" object; ":free" models allow 20
+# requests a minute and 50 a day (1000 a day once $10 of credit was ever bought). The free Gemma 4 26B is served only
+# by Google AI Studio, whose unpaid terms let Google use and human-review the text: see README "Summaries".
+# A paid model ID gets "zdr": OpenRouter then routes only to providers that keep nothing.
+OPENROUTER_ENV = DB_PATH.parent / "openrouter.env"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def openrouter_conf():
+    vals = read_env(OPENROUTER_ENV)
+    key = os.environ.get("OPENROUTER_API_KEY") or vals.get("OPENROUTER_API_KEY", "")
+    return key, os.environ.get("OPENROUTER_MODEL") or vals.get("OPENROUTER_MODEL") or "google/gemma-4-26b-a4b-it:free"
+
+
+def openrouter_chat(system, user, key, model):
+    body = {"model": model, "temperature": 0.2, "max_tokens": 1500, "reasoning": {"enabled": False},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if not model.endswith(":free"): body["provider"] = {"zdr": True}  # a :free endpoint is never ZDR
+    req = urllib.request.Request(OPENROUTER_URL, json.dumps(body).encode(), {
+        "Authorization": "Bearer " + key, "Content-Type": "application/json", "User-Agent": "timesheet"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r: res = json.load(r)
+    except urllib.error.HTTPError as e:  # 429 rate limit, 402 no credit, 503 no provider, 401 bad key
+        raise RuntimeError(f"OpenRouter said {e.code}: {e.read()[:200].decode(errors='replace')}") from None
+    choice = (res.get("choices") or [{}])[0]
+    text = ((choice.get("message") or {}).get("content") or "").strip()
+    if res.get("error") or choice.get("finish_reason") in ("error", "length") or not text:  # errors can come as a 200
+        raise RuntimeError(f"OpenRouter gave no answer: {json.dumps(res.get('error') or choice)[:200]}")
+    return text
+
+
 def llm(system, user):
     # Ollama silently drops input that doesn't fit its context window, so size the window to the input
     # (~3 chars per token, plus room for the answer) and refuse rather than summarise half the team.
@@ -471,6 +504,14 @@ def llm(system, user):
     need = (len(system) + len(user)) // 3 + 1500
     ctx = next((c for c in (8192, 16384, 32768) if need <= c), None)
     if not ctx: raise ValueError("too much text for one summary (more than ~100 people?)")
+    key, model = openrouter_conf()
+    if key:
+        try: return openrouter_chat(system, user, key, model)
+        except Exception as err: print(f"! {err}. Using {LLM_MODEL} on this server instead.", flush=True)
+    return local_llm(system, user, ctx)
+
+
+def local_llm(system, user, ctx):
     # think: False so a reasoning model (Qwen3, Qwen3.5, Gemma 4) answers directly; models without it accept it too.
     body = json.dumps({"model": LLM_MODEL, "stream": False, "keep_alive": "30m", "think": False,
                        # num_predict caps a runaway answer (seen once: 15+ minutes looping), which would
@@ -1721,11 +1762,23 @@ def selftest():
     try:
         print(f"Summaries with {LLM_MODEL} via Ollama ...", end=" ")
         t = time.time()
-        llm("Reply with the single word OK.", "Say OK.")
+        local_llm("Reply with the single word OK.", "Say OK.", 8192)
         print(f"ok, {time.time() - t:.0f}s")
     except Exception as e:
         ok = False
         print(f"FAILED: {e}")
+    key, model = openrouter_conf()
+    if key:
+        try:
+            print(f"OpenRouter {model} (used first; the above is the fallback) ...", end=" ")
+            t = time.time()
+            openrouter_chat("Reply with the single word OK.", "Say OK.", key, model)
+            print(f"ok, {time.time() - t:.0f}s")
+        except Exception as e:
+            ok = False
+            print(f"FAILED: {e}")
+    else:
+        print(f"OpenRouter: no key in {OPENROUTER_ENV}, so every summary uses {LLM_MODEL} above.")
     return ok
 
 

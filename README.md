@@ -2,7 +2,7 @@
 
 Employees record a voice note about their day, in Hindi, English or both, in the app or as a Slack message. The server turns it into English text and a short summary; they check it and submit. Admins see each person's days, summaries by day, month or any date range, tasks, and comments.
 
-Everything runs on one server you control. Summaries (Gemma 4 12B via Ollama) always run on that server, and so does speech-to-text (Whisper large-v3) unless you add a Groq key. Data is one SQLite file. Three optional extras change what leaves the server: **Groq** (step 5b) gets each voice note to turn it into text in seconds instead of minutes, and if Groq fails the server does it itself; the **Google Sheet** keeps a copy of people, tasks, transcripts and day summaries in your Google account, and voice notes sent through **Slack** stay in Slack too.
+Everything runs on one server you control. Speech-to-text (Whisper large-v3) and summaries (Gemma 4 12B via Ollama) run on that server unless you add a Groq or OpenRouter key. Data is one SQLite file. Four optional extras change what leaves the server: **Groq** (step 5b) gets each voice note to turn it into text in seconds instead of minutes; **OpenRouter** (step 5c) gets the text of notes and summaries to write summaries in seconds (if either fails, the server does the work itself); the **Google Sheet** keeps a copy of people, tasks, transcripts and day summaries in your Google account, and voice notes sent through **Slack** stay in Slack too.
 
 This repo (Trackr) is the working tool; the tags `v1.0`, `v2.0` and `v3.0` mark each version. Version 1, fully offline on one Mac, also lives on as the separate baseline repo `itej13/voice-timesheet`, a template for new projects.
 
@@ -13,7 +13,8 @@ This repo (Trackr) is the working tool; the tags `v1.0`, `v2.0` and `v3.0` mark 
  Server:  Caddy ──► app.py ──► SQLite        (nightly copy, kept 30 days)
                       ├─► Groq whisper-large-v3 (optional; used first when there's a key)
                       ├─► Whisper large-v3   (the fallback: NVIDIA GPU if there is one, else CPU)
-                      ├─► Ollama ─► Gemma 4 12B
+                      ├─► OpenRouter Gemma 4 26B (optional; used first when there's a key)
+                      ├─► Ollama ─► Gemma 4 12B (the fallback)
                       ├─► Slack          (optional; the server connects out, no open port)
                       └─► Google Sheet   (optional; synced about once a minute)
 ```
@@ -102,6 +103,29 @@ Without a GPU, turning a note into text takes about a minute on the server. Groq
    ```
 
 **Check:** `sudo /opt/timesheet/deploy/ts selftest` prints `Groq whisper-large-v3 … ok`. If Groq fails later, the live log shows `! Groq said …. Using Whisper on this server instead.` and notes still get done, just slower. Files over 25 MB (Groq's free-plan limit) always use the server.
+
+## 5c. Faster summaries with OpenRouter (optional)
+
+Without a GPU each summary takes a minute or more on the server. OpenRouter runs a bigger Gemma (4 26B) in seconds. With a key the app sends each summary there first, and uses the server's own Gemma if OpenRouter refuses, is down or is rate-limited. The text of people's notes, names included, then leaves your server.
+
+**Pick the model with care.** The default, `google/gemma-4-26b-a4b-it:free`, costs nothing but is served only by Google AI Studio, whose unpaid terms say Google uses what you send "to provide, improve, and develop" its products, that "human reviewers may read" it, and "Do not submit sensitive, confidential, or personal information". Free models also stop at 50 requests a day (1,000 once you have ever bought $10 of credit); after that the server takes over. The paid `google/gemma-4-26b-a4b-it` costs about $0.09 per million tokens in and $0.30–0.40 per million out (under $1 a month for 50 people), and the app then lets OpenRouter use only providers that keep nothing (zero data retention).
+
+1. At https://openrouter.ai/settings/keys create a key (it starts with `sk-or-`).
+2. Put it on the server, readable only by the app:
+   ```bash
+   sudo install -o root -g timesheet -m 640 /dev/null /var/lib/timesheet/openrouter.env
+   sudo nano /var/lib/timesheet/openrouter.env
+   ```
+   Write the key, and optionally the model (leave that line out for the free one), no quotes or spaces:
+   ```
+   OPENROUTER_API_KEY=sk-or-…
+   OPENROUTER_MODEL=google/gemma-4-26b-a4b-it
+   ```
+   ```bash
+   sudo systemctl restart timesheet
+   ```
+
+**Check:** `sudo /opt/timesheet/deploy/ts selftest` prints `OpenRouter … ok`. If OpenRouter fails later, the live log shows `! OpenRouter said …` and the server writes that summary itself.
 
 ## 6. Connect Slack (optional)
 
@@ -219,11 +243,11 @@ sudo systemctl start timesheet
 | `/var/lib/timesheet/timesheet.db` | All the data |
 | `/var/lib/timesheet/backups/` | Database copies |
 | `/var/lib/timesheet/models/` | The Whisper model (Ollama keeps Gemma in its own folder) |
-| `/var/lib/timesheet/slack.env`, `groq.env`, `google-key.json` | Slack tokens, the Groq key and the Google key: `root:timesheet`, mode 640 |
+| `/var/lib/timesheet/slack.env`, `groq.env`, `openrouter.env`, `google-key.json` | Slack tokens, the Groq and OpenRouter keys, and the Google key: `root:timesheet`, mode 640 |
 | `/etc/timesheet.env` | Settings written by `setup.sh`; it rewrites this file on every run, so don't edit it by hand |
 | Services | `timesheet` (the app), `timesheet-backup.timer`, `caddy` (HTTPS), `ollama` |
 
-**Secrets:** the Slack tokens, the Groq key and the Google key file never go in this repo, an email or a chat message. If one leaks, replace it: for Slack, make new tokens in the app's settings at api.slack.com and put them in `slack.env`; for Google, delete the key under the service account's **Keys**, make a new one and install it as in step 7.
+**Secrets:** the Slack tokens, the Groq and OpenRouter keys and the Google key file never go in this repo, an email or a chat message. If one leaks, replace it: for Slack, make new tokens in the app's settings at api.slack.com and put them in `slack.env`; for Google, delete the key under the service account's **Keys**, make a new one and install it as in step 7.
 
 ## Troubleshooting
 
@@ -231,6 +255,7 @@ sudo systemctl start timesheet
 |---|---|
 | The address doesn't open, or a certificate warning | Ports 80 and 443 open in the provider's firewall; the domain's A record points at this server; `journalctl -u caddy -n 50` |
 | "The microphone only works over HTTPS" or no microphone | Use the `https://` address; allow the microphone for the site in the browser's settings |
+| Summaries take minutes again although OpenRouter is set up | `journalctl -u timesheet | grep OpenRouter` shows why: 429 is the rate limit (a free model allows 50 a day), 401 a wrong key, 503 no provider available |
 | Notes take minutes again although Groq is set up | `journalctl -u timesheet | grep Groq` shows why: 401 is a wrong or deleted key, 429 is Groq's rate limit (it falls back by itself) |
 | Notes stay on "Transcribing…" or the self-test failed | `sudo /opt/timesheet/deploy/ts selftest`, then `journalctl -u timesheet -n 100`; `systemctl status ollama` and `ollama list` should show `gemma4:12b` |
 | Very slow (minutes per note) on a GPU server | `nvidia-smi` should list the card. If not, install the driver (`setup.sh` does it), reboot, run `setup.sh` again |
@@ -248,7 +273,7 @@ sudo systemctl start timesheet
 
 - **Editing:** today's entries can be edited, re-recorded or deleted until midnight India time. Older days are read-only. A draft left unsubmitted at midnight, or a recording made yesterday that uploads today, is submitted automatically, so nothing said is lost.
 - **Edits are visible:** when someone edits an already-submitted entry, admins see "edited" and the text from before the edit.
-- **Audio is deleted** as soon as it's been transcribed. Only text is stored. (Voice notes sent through Slack also stay in Slack. With a Groq key, Groq receives each note to transcribe it.)
+- **Audio is deleted** as soon as it's been transcribed. Only text is stored. (Voice notes sent through Slack also stay in Slack. With a Groq key, Groq receives each note to transcribe it; with an OpenRouter key, OpenRouter's provider receives the text to summarise.)
 - **Comments** are visible to admins only.
 - **Summaries:** day summaries are written automatically. Monthly, company and date-range summaries are written when an admin clicks Generate or Refresh.
 - **Tasks:** admins give tasks to people (Tasks page); each person sees theirs under **My tasks** and taps Start or Done. After a voice note, the AI checks it against that person's open tasks and may ask "Looks like you finished X. Mark it done?". Nothing changes until they tap Mark done.
@@ -282,7 +307,7 @@ ollama pull gemma4:12b
 .venv/bin/python app.py                      # http://localhost:8000
 ```
 
-Locally, Slack tokens go in `data/slack.env`, the Groq key in `data/groq.env` and the Google key in `data/google-key.json`; `data/` is never committed.
+Locally, Slack tokens go in `data/slack.env`, the Groq key in `data/groq.env`, the OpenRouter key in `data/openrouter.env` and the Google key in `data/google-key.json`; `data/` is never committed.
 
 Check the rules with the models faked:
 

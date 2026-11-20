@@ -21,7 +21,8 @@ def fake_llm(system, user):
     return f"summary of {user.count(chr(10))} lines"
 
 
-app.llm = fake_llm
+real_llm, app.llm = app.llm, fake_llm
+app.openrouter_conf = lambda: ("", "")  # never reach the real OpenRouter from a test
 app.init_db()
 app.create_user("boss", "Boss", "secret-one-1", is_admin=True)
 emp = app.create_user("emp", "Emp", "secret-two-2", role="Video editor")
@@ -541,5 +542,38 @@ f.write_bytes(b"FORM\0\0\0\0AIFF" + b"x" * 2000)
 assert real_run_whisper(f) == "from here" and sent == ["webm", "ogg"], "a format Groq refuses isn't sent"
 f.write_bytes(b"\0\0\0\x20ftypM4A " + b"x" * app.GROQ_MAX)
 assert real_run_whisper(f) == "from here" and len(sent) == 2, "over Groq's 25 MB: not sent"
+
+# ---------- summaries: OpenRouter first, Gemma on this server as the fallback ----------
+asked, real_chat = [], app.openrouter_chat
+def fake_openrouter(system, user, key, model):
+    asked.append(model)
+    if "busy" in user: raise RuntimeError("OpenRouter said 429: rate limited")
+    return "from openrouter"
+app.openrouter_chat, app.local_llm = fake_openrouter, lambda system, user, ctx: "from here"
+assert real_llm("s", "u") == "from here" and not asked, "no key: never OpenRouter"
+app.openrouter_conf = lambda: ("sk-or-test", "google/gemma-4-26b-a4b-it:free")
+assert real_llm("s", "u") == "from openrouter" and asked == ["google/gemma-4-26b-a4b-it:free"]
+assert real_llm("s", "busy") == "from here", "an OpenRouter error falls back to this server"
+try: real_llm("s", "x" * 200_000); raise AssertionError("too big for the fallback: refused before sending")
+except ValueError: assert len(asked) == 2
+
+# the request itself: no reasoning, ZDR asked for on a paid model only, errors inside a 200 caught
+class Resp:
+    def __init__(self, data): self.data = data
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def read(self, *a): return json.dumps(self.data).encode()
+reqs, reply = [], [{"choices": [{"message": {"content": " ok "}, "finish_reason": "stop"}]}]
+real_urlopen, app.urllib.request.urlopen = app.urllib.request.urlopen, lambda req, timeout: reqs.append(json.loads(req.data)) or Resp(reply[0])
+assert real_chat("s", "u", "k", "google/gemma-4-26b-a4b-it:free") == "ok"
+assert reqs[-1]["reasoning"] == {"enabled": False} and "provider" not in reqs[-1], "a :free endpoint can't be ZDR"
+real_chat("s", "u", "k", "google/gemma-4-26b-a4b-it")
+assert reqs[-1]["provider"] == {"zdr": True}, "a paid model only goes to providers that keep nothing"
+for bad in ({"error": {"code": 502, "message": "down"}}, {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}):
+    reply[0] = bad
+    try: real_chat("s", "u", "k", "m:free"); raise AssertionError(f"accepted {bad}")
+    except RuntimeError: pass
+app.urllib.request.urlopen = real_urlopen
+
 
 print("all checks passed")
